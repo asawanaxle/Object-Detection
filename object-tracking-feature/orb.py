@@ -1,126 +1,151 @@
-#!/usr/bin/python3
-
-# ------------------------------------------------------------------------------
-# automaticdai
-# YF Robotics Labrotary
-# Instagram: yfrobotics
-# Twitter: @yfrobotics
-# Website: https://www.yfrl.org
-# ------------------------------------------------------------------------------
-# References: 
-# - https://circuitdigest.com/tutorial/real-life-object-detection-using-opencv-python-detecting-objects-in-live-video
-# - https://docs.opencv.org/4.x/d1/d89/tutorial_py_orb.html
-# ------------------------------------------------------------------------------
-
+from flask import Flask, Response
 import cv2
-import numpy as np
-import time
+import numpy as np 
+from flask_cors import CORS
 
-def ORB_detector(new_image, image_template):
-    # Function that compares input image to template
-    # It then returns the number of ORB matches between them
-    image1 = cv2.cvtColor(new_image, cv2.COLOR_BGR2GRAY)
+app = Flask(__name__)
+CORS(app)
 
-    # Create ORB detector with 1000 keypoints with a scaling pyramid factor of 1.2
-    orb = cv2.ORB_create(1000, 1.2)
+# Load and preprocess the template images
+def preprocess_image(image):
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.equalizeHist(image)
 
-    # Detect keypoints of original image
-    (kp1, des1) = orb.detectAndCompute(image1, None)
+templates = [cv2.imread('images/1.png', 0), cv2.imread('images/2.jpg', 0)]
+templates = [preprocess_image(template) for template in templates]
 
-    # Detect keypoints of rotated image
-    (kp2, des2) = orb.detectAndCompute(image_template, None)
+def ORB_detector(new_image, templates):
+    image1 = preprocess_image(new_image)
+    orb = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, edgeThreshold=15)
+    kp1, des1 = orb.detectAndCompute(image1, None)
 
-    # Create matcher 
-    # Note we're no longer using Flannbased matching
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    # Do matching
-    matches = bf.match(des1,des2)
+    if len(kp1) == 0:
+        print("No keypoints found in the image.")
+        return []
 
-    # Sort the matches based on distance.  Least distance
-    # is better
-    matches = sorted(matches, key=lambda val: val.distance)
-    return len(matches)
+    final_matches = []
+    for template in templates:
+        if template is not None:
+            kp2, des2 = orb.detectAndCompute(template, None)
 
+            if len(kp2) == 0:
+                print("No keypoints found in the template.")
+                continue
 
-def visualize_fps(image, fps: int):
-    if len(np.shape(image)) < 3:
-        text_color = (255, 255, 255)  # white
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = bf.match(des1, des2)
+            print(f"Total matches found: {len(matches)}")
+
+            # Loosen the distance threshold to consider more matches as good
+            good_matches = [m for m in matches if m.distance < 75]
+            print(f"Good matches found: {len(good_matches)}")
+
+            if len(good_matches) > 10:
+                src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                if M is not None and np.linalg.det(M) > 0.1 and mask is not None and mask.sum() > 5:
+                    print("Valid homography found.")
+                    final_matches.append((good_matches, kp1, kp2, template, M, mask))
+                else:
+                    print("Homography is invalid or has too few inliers.")
+                    print(f"Det(M): {np.linalg.det(M) if M is not None else 'None'}, Mask Sum: {mask.sum() if mask is not None else 'None'}")
+            else:
+                print("Insufficient good matches; skipping this template.")
+
+    if not final_matches:
+        print("No matches found; matches_info is empty.")
+
+    return final_matches
+
+THRESHOLD = 15
+
+def draw_bounding_boxes(image, matches_info):
+    object_detected = False 
+    print("Entered draw_bounding_boxes function.") 
+
+    for matches, kp1, kp2, template, M, mask in matches_info:
+        if M is not None:
+            h, w = template.shape
+            pts = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
+            dst = cv2.perspectiveTransform(pts, M)
+            x, y, w, h = cv2.boundingRect(np.int32(dst))
+            
+            # Debug output
+            print(f"Debug: Keypoints in image: {len(kp1)}")
+            print(f"Debug: Keypoints in template: {len(kp2)}")
+            print(f"Debug: Number of matches: {len(matches)}")
+            print(f"Debug: Homography matrix: {M}")
+            print(f"Debug: Bounding box coordinates: x={x}, y={y}, w={w}, h={h}")
+
+            if len(matches) > THRESHOLD:
+                object_detected = True
+                # Ensure coordinates are within image bounds
+                if x >= 0 and y >= 0 and (x + w) <= image.shape[1] and (y + h) <= image.shape[0]:
+                    cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                    cv2.putText(image, f"Matches: {len(matches)}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    print(f"Object detected! Bounding box: ({x}, {y}, {x+w}, {y+h})")
+                else:
+                    print("Bounding box coordinates out of image bounds.")
+        else:
+            print(f"Homography computation failed or insufficient inliers. Mask sum: {mask.sum()}")
+
+    if object_detected:
+        print("Object detected on screen!")
     else:
-        text_color = (0, 255, 0)  # green
-    row_size = 20  # pixels
-    left_margin = 24  # pixels
-
-    font_size = 1
-    font_thickness = 1
-
-    # Draw the FPS counter
-    fps_text = 'FPS = {:.1f}'.format(fps)
-    text_location = (left_margin, row_size)
-    cv2.putText(image, fps_text, text_location, cv2.FONT_HERSHEY_PLAIN,
-                font_size, text_color, font_thickness)
-
+        print("No object detected.")
+    
     return image
 
+@app.route('/events')
+def events():
+    def generate():
+        cap = cv2.VideoCapture(0)  # Use 0 for default webcam
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            matches_info = ORB_detector(frame, templates)
+            frame_with_boxes = draw_bounding_boxes(frame, matches_info)
+            
+            _, img_encoded = cv2.imencode('.jpg', frame_with_boxes)
+            img_bytes = img_encoded.tobytes()
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + img_bytes + b"\r\n")
+        cap.release()
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-fps = 0
+@app.route('/status')
+def status():
+    def generate():
+        cap = cv2.VideoCapture(0)  # Use 0 for default webcam
+        last_detection_time = None
+        consistent_detections = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            matches_info = ORB_detector(frame, templates)
+            object_detected = any(len(matches) > THRESHOLD for matches, _, _, _, _, _ in matches_info)
+            
+            if object_detected:
+                current_time = cv2.getTickCount() / cv2.getTickFrequency()
+                if last_detection_time is None or current_time - last_detection_time > 1.0:
+                    consistent_detections = 1
+                else:
+                    consistent_detections += 1
+                last_detection_time = current_time
+            else:
+                consistent_detections = 0
 
-cap = cv2.VideoCapture(0)
+            status = 'Object detected on the UI' if consistent_detections > 0 else 'Object Not Found'
+            
+            yield f"data: {status}\n\n"
+        cap.release()
+    return Response(generate(), content_type='text/event-stream')
 
-# Load our image template, this is our reference image
-image_template = cv2.imread('images/simple.png', 0) 
-
-while True:
-    # ----------------------------------------------------------------------
-    # record start time
-    start_time = time.time()
-    # Get webcam images
-    ret, frame = cap.read()
-
-    # Get height and width of webcam frame
-    height, width = frame.shape[:2]
-
-    # Define ROI Box Dimensions (Note some of these things should be outside the loop)
-    top_left_x = int(width / 3)
-    top_left_y = int((height / 2) + (height / 4))
-    bottom_right_x = int((width / 3) * 2)
-    bottom_right_y = int((height / 2) - (height / 4))
-
-    # Draw rectangular window for our region of interest
-    cv2.rectangle(frame, (top_left_x,top_left_y), (bottom_right_x,bottom_right_y), 255, 3)
-
-    # Crop window of observation we defined above
-    cropped = frame[bottom_right_y:top_left_y , top_left_x:bottom_right_x]
-
-    # Flip frame orientation horizontally
-    frame = cv2.flip(frame,1)
-
-    # Get number of ORB matches 
-    matches = ORB_detector(cropped, image_template)
-
-    # Display status string showing the current no. of matches 
-    output_string = "# of Matches = " + str(matches)
-    cv2.putText(frame, output_string, (50,450), cv2.FONT_HERSHEY_COMPLEX, 1, (250,0,0), 2)
-
-    # Our threshold to indicate object deteciton
-    # For new images or lightening conditions you may need to experiment a bit 
-    # Note: The ORB detector to get the top 1000 matches, 350 is essentially a min 35% match
-    threshold = 200
-
-    # If matches exceed our threshold then object has been detected
-    if matches > threshold:
-        cv2.rectangle(frame, (top_left_x,top_left_y), (bottom_right_x,bottom_right_y), (0,255,0), 3)
-        cv2.putText(frame,'Object Found',(50,50), cv2.FONT_HERSHEY_COMPLEX, 2 ,(0,255,0), 2)
-
-    cv2.imshow('Object Detector using ORB', visualize_fps(frame, fps))
-    # ----------------------------------------------------------------------
-    # record end time
-    end_time = time.time()
-    # calculate FPS
-    seconds = end_time - start_time
-    fps = 1.0 / seconds
-    print("Estimated fps:{0:0.1f}".format(fps))
-    if cv2.waitKey(1) == 13: #13 is the Enter Key
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0')
